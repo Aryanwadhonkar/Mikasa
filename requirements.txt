@@ -1,0 +1,4 @@
+python-telegram-bot==20.0  # Adjust version as needed based on compatibility
+pyrogram==1.2.0             # Adjust version as needed based on compatibility
+python-dotenv==0.19.1       # For loading environment variables
+apscheduler==3.9.1          # For scheduling tasks like auto-deletion
