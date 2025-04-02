@@ -375,11 +375,11 @@ async def list_banned(update: Update, context: ContextTypes.DEFAULT_TYPE):
         banned = json.load(f)
     
     if banned:
-    await update.message.reply_text(
-        mikasa_reply('info') + "Banned users:\n" + "\n".join(map(str, banned))
-    )
-else:
-    await update.message.reply_text(mikasa_reply('info') + "No banned users!")
+        await update.message.reply_text(
+            mikasa_reply('info') + "Banned users:\n" + "\n".join(map(str, banned))
+        )
+    else:
+        await update.message.reply_text(mikasa_reply('info') + "No banned users!")
 
 @admin_only
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
