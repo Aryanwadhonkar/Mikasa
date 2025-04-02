@@ -1,0 +1,452 @@
+import os
+import json
+import logging
+import random
+import uuid
+import sys
+import asyncio
+from datetime import time, timezone
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CallbackContext,
+    JobQueue,
+    CallbackQueryHandler
+)
+
+# -------------------- CONFIGURATION -------------------- #
+load_dotenv()
+
+TOKEN = os.getenv("BOT_TOKEN")
+ADMINS = [int(id) for id in os.getenv("ADMINS").split(",")] if os.getenv("ADMINS") else []
+DATABASE_CHANNEL = int(os.getenv("DATABASE_CHANNEL"))
+AUTO_DELETE = int(os.getenv("AUTO_DELETE", 0))
+
+# -------------------- FILE PATHS -------------------- #
+BANNED_USERS_FILE = "banned_users.json"
+FILE_DATABASE = "files.json"
+BATCHES_FILE = "batches.json"
+CHANNELS_FILE = "channels.json"
+
+# Initialize data files
+for file in [BANNED_USERS_FILE, FILE_DATABASE, BATCHES_FILE, CHANNELS_FILE]:
+    if not os.path.exists(file):
+        with open(file, 'w') as f:
+            json.dump([] if "banned" in file else {}, f)
+
+# -------------------- ENHANCED MIKASA PHRASES -------------------- #
+MIKASA_QUOTES = {
+    'ban': ["⚡ Target eliminated!", "❌ Threat neutralized!"],
+    'unban': ["🎌 Access restored!", "⚔️ Second chance granted!"],
+    'error': ["💔 Failed... Eren would be disappointed!", "🔪 Mission failed!"],
+    'success': ["✅ Mission accomplished!", "⚔️ Objective complete!"],
+    'warning': ["⚠️ Not so fast!", "🔍 I'm watching you..."],
+    'info': ["📜 Report:", "📊 Status:"],
+    'greeting': ["⚔️ I'm here to protect!", "🔪 Ready for orders!"],
+    'default': ["❓ Hmm?", "💭 ..."],
+    'force_join': ["⚔️ Join our regiments!", "🔪 Prove your loyalty!"]
+}
+
+def mikasa_reply(category='default'):
+    return random.choice(MIKASA_QUOTES.get(category, MIKASA_QUOTES['default'])) + "\n"
+
+# -------------------- ADMIN DECORATOR -------------------- #
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id not in ADMINS:
+            await update.message.reply_text(mikasa_reply('warning') + "Unauthorized!")
+            return
+        return await func(update, context)
+    return wrapper
+
+# -------------------- SELF-HEALING SYSTEM -------------------- #
+async def self_repair(application):
+    repairs = 0
+    try:
+        with open(FILE_DATABASE, 'r+') as f:
+            files = json.load(f)
+            valid_files = {}
+            for file_id, msg_id in files.items():
+                try:
+                    await application.bot.get_chat_message(
+                        chat_id=DATABASE_CHANNEL,
+                        message_id=msg_id
+                    )
+                    valid_files[file_id] = msg_id
+                except Exception:
+                    repairs += 1
+            f.seek(0)
+            json.dump(valid_files, f)
+            f.truncate()
+        
+        with open(BATCHES_FILE, 'r+') as bf:
+            batches = json.load(bf)
+            valid_batches = {}
+            for batch_id, file_ids in batches.items():
+                valid_files_in_batch = [fid for fid in file_ids if fid in valid_files]
+                if valid_files_in_batch:
+                    valid_batches[batch_id] = valid_files_in_batch
+                else:
+                    repairs += 1
+            bf.seek(0)
+            json.dump(valid_batches, bf)
+            bf.truncate()
+        
+        logging.info(f"Self-repair completed. Fixed {repairs} issues")
+        return repairs
+    except Exception as e:
+        logging.error(f"Self-repair failed: {e}")
+        return 0
+
+# -------------------- ERROR HANDLER -------------------- #
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    error = context.error
+    logging.error(f"Error: {error}")
+    
+    if "Message to copy not found" in str(error):
+        repairs = await self_repair(context.application)
+        if update and hasattr(update, 'message'):
+            await update.message.reply_text(mikasa_reply('error') + "Content expired! Try again now.")
+        return
+    
+    await context.bot.send_message(
+        chat_id=ADMINS[0],
+        text=mikasa_reply('error') + f"Critical Error:\n{error}\nRebooting..."
+    )
+    await asyncio.sleep(10)
+    os.execl(sys.executable, sys.executable, *sys.argv)
+
+# -------------------- FORCE JOIN SYSTEM -------------------- #
+async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    with open(CHANNELS_FILE, 'r') as f:
+        channels = json.load(f)
+    
+    unjoined = []
+    for channel_id, channel_data in channels.items():
+        try:
+            member = await context.bot.get_chat_member(channel_id, user_id)
+            if member.status not in ['member', 'administrator', 'creator']:
+                unjoined.append(channel_data)
+        except Exception as e:
+            logging.error(f"Channel check error: {e}")
+    
+    return len(unjoined) == 0, unjoined
+
+async def force_join_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    if query.data.startswith("verify_"):
+        is_member, unjoined = await check_subscription(user_id, context)
+        if is_member:
+            await query.edit_message_text(mikasa_reply('success') + "Access granted! Try the link again.")
+            return
+    
+    with open(CHANNELS_FILE, 'r') as f:
+        channels = json.load(f)
+    
+    buttons = []
+    for channel_id, channel_data in channels.items():
+        buttons.append([InlineKeyboardButton(
+            text=f"Join {channel_data['name']}", 
+            url=channel_data['invite_link']
+        )])
+    
+    buttons.append([InlineKeyboardButton(
+        text="I've Joined ✅", 
+        callback_data=f"verify_{user_id}"
+    )])
+    
+    await query.edit_message_text(
+        mikasa_reply('force_join') + "Join these channels to continue:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+@admin_only
+async def force_join_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            mikasa_reply('warning') + "Usage:\n"
+            "/forcejoin add <channel_id> <invite_link> <name>\n"
+            "/forcejoin remove <channel_id>"
+        )
+        return
+    
+    action = context.args[0].lower()
+    channel_id = context.args[1] if len(context.args) > 1 else None
+    
+    with open(CHANNELS_FILE, 'r+') as f:
+        channels = json.load(f)
+        
+        if action == "add" and len(context.args) >= 4:
+            channels[channel_id] = {
+                "invite_link": context.args[2],
+                "name": ' '.join(context.args[3:])
+            }
+            await update.message.reply_text(mikasa_reply('success') + "Channel added!")
+        
+        elif action == "remove" and channel_id:
+            if channel_id in channels:
+                del channels[channel_id]
+                await update.message.reply_text(mikasa_reply('success') + "Channel removed!")
+            else:
+                await update.message.reply_text(mikasa_reply('warning') + "Channel not found!")
+        
+        else:
+            await update.message.reply_text(mikasa_reply('warning') + "Invalid command!")
+        
+        f.seek(0)
+        json.dump(channels, f)
+        f.truncate()
+
+# -------------------- FILE MANAGEMENT -------------------- #
+@admin_only
+async def start_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['batch'] = []
+    await update.message.reply_text(mikasa_reply('success') + "Batch collection started!")
+
+@admin_only
+async def end_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'batch' not in context.user_data or not context.user_data['batch']:
+        await update.message.reply_text(mikasa_reply('warning') + "No active batch!")
+        return
+    
+    batch_id = str(uuid.uuid4())
+    with open(BATCHES_FILE, 'r+') as f:
+        batches = json.load(f)
+        batches[batch_id] = context.user_data['batch']
+        f.seek(0)
+        json.dump(batches, f)
+    
+    await update.message.reply_text(
+        mikasa_reply('success') + f"Batch stored!\nShare link:\nt.me/{context.bot.username}?start={batch_id}"
+    )
+    context.user_data.pop('batch')
+
+@admin_only
+async def store_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file_id = str(uuid.uuid4())
+    msg = await context.bot.forward_message(
+        chat_id=DATABASE_CHANNEL,
+        from_chat_id=update.message.chat_id,
+        message_id=update.message.message_id
+    )
+    
+    with open(FILE_DATABASE, 'r+') as f:
+        files = json.load(f)
+        files[file_id] = msg.message_id
+        f.seek(0)
+        json.dump(files, f)
+    
+    if 'batch' in context.user_data:
+        context.user_data['batch'].append(file_id)
+        reply_text = "File added to batch! Send more or /lastbatch"
+    else:
+        reply_text = f"File stored!\nLink: t.me/{context.bot.username}?start={file_id}"
+    
+    await update.message.reply_text(mikasa_reply('success') + reply_text)
+
+# -------------------- MAIN FUNCTIONALITY -------------------- #
+async def send_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        file_id = context.args[0] if context.args else None
+        
+        with open(BANNED_USERS_FILE, 'r') as f:
+            if str(user_id) in json.load(f):
+                await update.message.reply_text(mikasa_reply('ban') + "Banned!")
+                return
+        
+        is_member, unjoined = await check_subscription(user_id, context)
+        if not is_member:
+            buttons = []
+            for channel in unjoined:
+                buttons.append([InlineKeyboardButton(
+                    text=f"Join {channel['name']}", 
+                    url=channel['invite_link']
+                )])
+            buttons.append([InlineKeyboardButton(
+                text="I've Joined ✅", 
+                callback_data=f"verify_{user_id}"
+            )])
+            
+            await update.message.reply_text(
+                mikasa_reply('force_join') + "Join these channels to access content:",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            return
+        
+        with open(FILE_DATABASE, 'r') as f:
+            files = json.load(f)
+            if file_id in files:
+                msg = await context.bot.copy_message(
+                    chat_id=update.effective_chat.id,
+                    from_chat_id=DATABASE_CHANNEL,
+                    message_id=files[file_id]
+                )
+                if AUTO_DELETE > 0:
+                    context.job_queue.run_once(
+                        lambda ctx, mid=msg.message_id: ctx.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=mid
+                        ), 
+                        AUTO_DELETE * 60
+                    )
+            else:
+                with open(BATCHES_FILE, 'r') as bf:
+                    batches = json.load(bf)
+                    if file_id in batches:
+                        for fid in batches[file_id]:
+                            if fid in files:
+                                msg = await context.bot.copy_message(
+                                    chat_id=update.effective_chat.id,
+                                    from_chat_id=DATABASE_CHANNEL,
+                                    message_id=files[fid]
+                                )
+                                if AUTO_DELETE > 0:
+                                    context.job_queue.run_once(
+                                        lambda ctx, mid=msg.message_id: ctx.bot.delete_message(
+                                            chat_id=update.effective_chat.id,
+                                            message_id=mid
+                                        ), 
+                                        AUTO_DELETE * 60
+                                    )
+                                await asyncio.sleep(1)
+                    else:
+                        await update.message.reply_text(mikasa_reply('warning') + "Invalid link!")
+    
+    except Exception as e:
+        if "Message to copy not found" in str(e):
+            await self_repair(context.application)
+            await update.message.reply_text(mikasa_reply('error') + "Content expired! Try again now.")
+        else:
+            raise e
+
+# -------------------- ADMIN COMMANDS -------------------- #
+@admin_only
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(mikasa_reply('warning') + "Provide user ID!")
+        return
+    
+    try:
+        user_id = int(context.args[0])
+        with open(BANNED_USERS_FILE, 'r+') as f:
+            banned = json.load(f)
+            if user_id in banned:
+                await update.message.reply_text(mikasa_reply('warning') + "Already banned!")
+            else:
+                banned.append(user_id)
+                f.seek(0)
+                json.dump(banned, f)
+                await update.message.reply_text(mikasa_reply('ban') + f"Banned {user_id}!")
+    except ValueError:
+        await update.message.reply_text(mikasa_reply('warning') + "Invalid ID!")
+
+@admin_only
+async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(mikasa_reply('warning') + "Provide user ID!")
+        return
+    
+    try:
+        user_id = int(context.args[0])
+        with open(BANNED_USERS_FILE, 'r+') as f:
+            banned = json.load(f)
+            if user_id in banned:
+                banned.remove(user_id)
+                f.seek(0)
+                json.dump(banned, f)
+                await update.message.reply_text(mikasa_reply('unban') + f"Unbanned {user_id}!")
+            else:
+                await update.message.reply_text(mikasa_reply('warning') + "Not banned!")
+    except ValueError:
+        await update.message.reply_text(mikasa_reply('warning') + "Invalid ID!")
+
+@admin_only
+async def list_banned(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with open(BANNED_USERS_FILE, 'r') as f:
+        banned = json.load(f)
+    
+    if banned:
+    await update.message.reply_text(
+        mikasa_reply('info') + "Banned users:\n" + "\n".join(map(str, banned))
+    )
+else:
+    await update.message.reply_text(mikasa_reply('info') + "No banned users!")
+
+@admin_only
+async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with open(CHANNELS_FILE, 'r') as f:
+        channels = json.load(f)
+    
+    settings_msg = f"""
+{mikasa_reply('info')}⚙️ Current Settings:
+• Auto-delete: {AUTO_DELETE} mins
+• Force sub: {len(channels) if channels else 'Disabled'}
+• Admins: {', '.join(map(str, ADMINS))}
+"""
+    await update.message.reply_text(settings_msg)
+
+@admin_only
+async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(mikasa_reply('default') + "Rebooting...")
+    await context.application.shutdown()
+    os.execl(sys.executable, sys.executable, *sys.argv)
+
+# -------------------- MAINTENANCE -------------------- #
+async def daily_maintenance(context: CallbackContext):
+    repairs = await self_repair(context.application)
+    await context.bot.send_message(
+        chat_id=ADMINS[0],
+        text=mikasa_reply('success') + f"Daily maintenance completed. Fixed {repairs} issues."
+    )
+
+# -------------------- MAIN -------------------- #
+async def main():
+    try:
+        application = ApplicationBuilder().token(TOKEN).build()
+        
+        if application.job_queue:
+            application.job_queue.run_daily(
+                daily_maintenance,
+                time=time(3, 0, 0, tzinfo=timezone.utc)
+            )
+        
+        await self_repair(application)
+        
+        handlers = [
+            CommandHandler("start", send_file),
+            CommandHandler("getlink", store_file),
+            CommandHandler("firstbatch", start_batch),
+            CommandHandler("lastbatch", end_batch),
+            CommandHandler("ban", ban_user),
+            CommandHandler("unban", unban_user),
+            CommandHandler("listbanned", list_banned),
+            CommandHandler("forcejoin", force_join_config),
+            CommandHandler("settings", settings),
+            CommandHandler("restart", restart),
+            MessageHandler(filters.ALL & filters.ChatType.PRIVATE, store_file),
+            CallbackQueryHandler(force_join_handler, pattern=r"^verify_")
+        ]
+        
+        for handler in handlers:
+            application.add_handler(handler)
+        
+        application.add_error_handler(error_handler)
+        
+        print("⚔️ Mikasa is operational! ⚔️")
+        await application.run_polling()
+        
+    except Exception as e:
+        logging.error(f"Fatal error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())
